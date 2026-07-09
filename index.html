@@ -1105,7 +1105,6 @@ function clusterPoints(pts, radius) {
 function avgBright(d) { let s = 0; for (let i = 0; i < d.length; i += 4) s += (d[i]+d[i+1]+d[i+2])/3; return s/(d.length/4); }
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-const threatSources = {};
 function pushThreat(level, source, msg) {
   const prev = threatSources[source] || 0;
   if (level > prev) { threatSources[source] = level; addAlert(msg, level === 2 ? 'alert' : 'warn'); }
