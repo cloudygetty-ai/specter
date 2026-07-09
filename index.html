@@ -534,8 +534,14 @@ function startMagnetometer(){
   document.getElementById('magStatus').textContent='STARTING';
   document.getElementById('magLog').textContent='// Requesting sensor access...';
   if('DeviceOrientationEvent' in window){
-    // Try DeviceMotion for magnetic data
-    window.addEventListener('deviceorientation',handleOrientation,true);
+    // iOS 13+ requires permission
+    if(typeof DeviceOrientationEvent.requestPermission === 'function'){
+      DeviceOrientationEvent.requestPermission().then(s=>{
+        if(s==='granted') window.addEventListener('deviceorientation',handleOrientation,true);
+      }).catch(()=>{});
+    } else {
+      window.addEventListener('deviceorientation',handleOrientation,true);
+    }
     document.getElementById('magStatus').textContent='ACTIVE';
     document.getElementById('magStatus').className='mod-status active';
     document.getElementById('magLog').textContent='// Magnetometer active — move device slowly near objects';
@@ -715,7 +721,7 @@ function avgBrightness(d){
 // ══ NETWORK SCAN ════════════════════════════════════
 // Probe common IP addresses for open ports used by IP cameras.
 const CAM_PORTS=[80,8080,554,8554,8888,81,7070,8000,9000];
-const CAM_PATHS=['/',''/video','/videostream.cgi','/mjpg/video.mjpg','/stream','/live','/snapshot.jpg','/cgi-bin/viewer/video.jpg'];
+const CAM_PATHS=['/','/video','/videostream.cgi','/mjpg/video.mjpg','/stream','/live','/snapshot.jpg','/cgi-bin/viewer/video.jpg'];
 
 async function scanNetwork(){
   if(netScanActive)return;
