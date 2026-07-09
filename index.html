@@ -193,6 +193,7 @@ video#camfeedvid{width:100%;display:block;max-height:240px}
     <div class="camoff" id="camoff">
       <div class="camoff-ico">📷</div>
       <div class="camoff-txt">CAMERA OFFLINE — TAP SCAN TO ACTIVATE</div>
+    <div style="font-size:7px;letter-spacing:.12em;color:#442233;margin-top:8px;padding:0 20px;text-align:center">TIP: WORKS BEST IN A DIMLY LIT ROOM — TURN OFF VISIBLE LIGHTS FOR HIGHEST ACCURACY</div>
     </div>
     <video id="cam" autoplay playsinline muted style="display:none"></video>
     <canvas id="iro"></canvas>
@@ -486,12 +487,18 @@ function startIRScan() {
   hotspotTracker = {};
   confirmedHotspots = [];
 
+  // Calibration: collect ambient brightness profile for first 40 frames
+  // so we can auto-reject persistent white/visible-light sources (lamps, screens)
+  let ambientProfile = null;
+  let ambientBuf = [];
+  const AMBIENT_FRAMES = 40;
+
   function frame() {
     if (!scanning) return;
     frameCount++;
     document.getElementById('framePill').textContent = 'FRAME ' + frameCount;
-
     if (vid.readyState < 2) { rafId = requestAnimationFrame(frame); return; }
+
     const W = vid.videoWidth, H = vid.videoHeight;
     if (!W || !H) { rafId = requestAnimationFrame(frame); return; }
 
@@ -504,68 +511,151 @@ function startIRScan() {
     const d = img.data;
     const raw = [];
 
-    // Multi-threshold IR detection
-    // Threshold 1: IR signature (high R+B, low-mid G) — classic IR LED look
-    // Threshold 2: Pure white bloom (all channels maxed — bright IR overexposure)
-    // Threshold 3: Purple/violet tone (near-IR at 850nm appears purple on phone sensors)
-    for (let y = 0; y < H; y += 3) {
-      for (let x = 0; x < W; x += 3) {
+    // ── AMBIENT CALIBRATION ──
+    // Build a per-region brightness map to ignore persistent bright areas (lamps, windows)
+    const GRID = 16;
+    const cellW = Math.floor(W / GRID), cellH = Math.floor(H / GRID);
+    const regionBright = new Float32Array(GRID * GRID);
+    for (let gy = 0; gy < GRID; gy++) {
+      for (let gx = 0; gx < GRID; gx++) {
+        let sum = 0, cnt = 0;
+        for (let y = gy * cellH; y < Math.min(H, (gy+1)*cellH); y += 4) {
+          for (let x = gx * cellW; x < Math.min(W, (gx+1)*cellW); x += 4) {
+            const i = (y*W+x)*4;
+            sum += (d[i]+d[i+1]+d[i+2])/3; cnt++;
+          }
+        }
+        regionBright[gy*GRID+gx] = cnt > 0 ? sum/cnt : 0;
+      }
+    }
+    if (frameCount <= AMBIENT_FRAMES) {
+      ambientBuf.push(regionBright);
+      if (ambientBuf.length >= AMBIENT_FRAMES) {
+        // Average per-region — this is the "visible light baseline"
+        ambientProfile = new Float32Array(GRID * GRID);
+        ambientBuf.forEach(rb => rb.forEach((v, i) => { ambientProfile[i] += v; }));
+        ambientProfile = ambientProfile.map(v => v / AMBIENT_FRAMES);
+        addAlert('Ambient calibration complete — IR-only detection active', 'info');
+      }
+      document.getElementById('irLog').textContent = 'Calibrating ambient light... ' + Math.round((frameCount/AMBIENT_FRAMES)*100) + '%';
+      rafId = requestAnimationFrame(frame);
+      return;
+    }
+
+    // ── PRECISION IR DETECTION ──
+    // 850nm / 940nm IR LED signature on mobile camera sensors:
+    //   R channel: HIGH (sensor very sensitive to near-IR → red channel blooms)
+    //   G channel: SUPPRESSED relative to R (key discriminator vs white light)
+    //   B channel: MEDIUM — present but less than R (creates the violet/purple bloom)
+    //   Result: distinctly PURPLE / MAGENTA appearance
+    //
+    // REJECT:
+    //   White light lamps:  R≈G≈B all high — green NOT suppressed
+    //   Red LEDs:           R high, G≈0, B≈0 — no blue component
+    //   Blue LEDs:          B high, R/G low
+    //   Green LEDs:         G high
+    //   Sunlight/windows:   All channels high + ambient profile match
+    //   Ceiling lights:     Large uniform bright regions
+
+    const STEP = 3;
+    for (let y = 0; y < H; y += STEP) {
+      for (let x = 0; x < W; x += STEP) {
         const i = (y * W + x) * 4;
         const r = d[i], g = d[i+1], b = d[i+2];
-        const bright = (r + g + b) / 3;
-        // IR signature scoring
-        const irScore =
-          ((r > 235 && b > 160 && g < 230) ? 1.0 : 0) +   // purple IR
-          ((r > 245 && g > 245 && b > 245) ? 0.8 : 0) +   // white bloom
-          ((r > 220 && b > 200 && g < 200) ? 0.9 : 0) +   // violet IR
-          ((bright > 240 && r > g * 1.1) ? 0.6 : 0);       // bright warm
-        if (irScore >= 0.8) raw.push({ x, y, score: irScore });
+
+        // ── Gate 1: Minimum brightness (must be a significant light source) ──
+        if (r < 160) continue;
+
+        // ── Gate 2: Green suppression — THE key IR discriminator ──
+        // For 850nm IR: R is high, G is notably below R
+        // White light: G ≈ R (fails this gate)
+        const greenSuppression = (r - g) / (r + 1.0);
+        if (greenSuppression < 0.18) continue;  // not IR — too much green
+
+        // ── Gate 3: Blue presence — creates the purple bloom ──
+        // True IR at 850nm: B is medium-high but < R
+        // Pure red LED: B ≈ 0 (fails this gate)
+        const blueRatio = b / (r + 1.0);
+        if (blueRatio < 0.25 || blueRatio > 0.92) continue; // pure red or near-white
+
+        // ── Gate 4: Reject pure white bloom ──
+        // White light saturates all channels equally
+        const isWhite = (r > 220 && g > 200 && b > 200 && greenSuppression < 0.25);
+        if (isWhite) continue;
+
+        // ── Gate 5: Ambient profile rejection ──
+        // If this region was already bright in ambient calibration, it's a lamp
+        if (ambientProfile) {
+          const gx = Math.min(GRID-1, Math.floor(x/W*GRID));
+          const gy = Math.min(GRID-1, Math.floor(y/H*GRID));
+          const ambientBrightness = ambientProfile[gy*GRID+gx];
+          // If ambient was already bright here AND current pixel is just bright (not IR-specific)
+          if (ambientBrightness > 140 && greenSuppression < 0.28) continue;
+        }
+
+        // ── Compute IR confidence score ──
+        // Higher = more confident this is 850nm IR
+        const irScore = greenSuppression * 0.6 + (1.0 - blueRatio) * 0.2 + Math.min(1, r/255) * 0.2;
+
+        raw.push({ x, y, score: irScore });
       }
     }
 
-    // Cluster raw detections
-    const currentClusters = clusterPoints(raw, 25);
+    // ── CLUSTER with minimum size filter ──
+    // Camera IR LEDs: small tight clusters (point sources)
+    // Lamps: large diffuse regions
+    const allClusters = clusterPoints(raw, 22);
+
+    // Filter: reject clusters that are too large (lamp/window) or too small (noise)
+    // At 1-5m, a camera's IR LED array spans ~10-80px diameter on a 1080p sensor
+    const currentClusters = allClusters.filter(c => {
+      // Size check: minimum 3 raw pixels, maximum 200 (lamp-sized)
+      if (c.size < 3 || c.size > 200) return false;
+      // Score check: must have strong IR signature
+      if (c.avgScore < 0.22) return false;
+      // Ambient rejection: if this region was lit in ambient profile, skip
+      if (ambientProfile) {
+        const gx = Math.min(GRID-1, Math.floor(c.x/W*GRID));
+        const gy = Math.min(GRID-1, Math.floor(c.y/H*GRID));
+        if (ambientProfile[gy*GRID+gx] > 160) return false;
+      }
+      return true;
+    });
 
     // ── TEMPORAL PERSISTENCE ──
-    // Age out old trackers
     const activeIds = new Set();
-    currentClusters.forEach((c, i) => {
-      // Find matching tracker (within 60px)
+    currentClusters.forEach((c, idx) => {
       let bestId = null, bestDist = Infinity;
       Object.keys(hotspotTracker).forEach(id => {
         const t = hotspotTracker[id];
         const dx = c.x - t.lastX, dy = c.y - t.lastY;
         const dist = Math.sqrt(dx*dx + dy*dy);
-        if (dist < 60 && dist < bestDist) { bestDist = dist; bestId = id; }
+        if (dist < 55 && dist < bestDist) { bestDist = dist; bestId = id; }
       });
       if (bestId) {
         hotspotTracker[bestId].frames++;
         hotspotTracker[bestId].lastX = c.x;
         hotspotTracker[bestId].lastY = c.y;
         hotspotTracker[bestId].maxSize = Math.max(hotspotTracker[bestId].maxSize, c.size);
-        hotspotTracker[bestId].avgScore = (hotspotTracker[bestId].avgScore + c.avgScore) / 2;
+        hotspotTracker[bestId].avgScore = hotspotTracker[bestId].avgScore * 0.9 + c.avgScore * 0.1;
         activeIds.add(bestId);
       } else {
-        const newId = 'hs' + Date.now() + i;
-        hotspotTracker[newId] = {
-          frames: 1, lastX: c.x, lastY: c.y,
-          maxSize: c.size, avgScore: c.avgScore || 1,
-          firstSeen: frameCount
-        };
+        const newId = 'hs' + Date.now() + idx;
+        hotspotTracker[newId] = { frames:1, lastX:c.x, lastY:c.y, maxSize:c.size, avgScore:c.avgScore, firstSeen:frameCount };
         activeIds.add(newId);
       }
     });
-    // Decay inactive trackers
+    // Decay non-persistent trackers faster
     Object.keys(hotspotTracker).forEach(id => {
       if (!activeIds.has(id)) {
-        hotspotTracker[id].frames = Math.max(0, hotspotTracker[id].frames - 2);
+        hotspotTracker[id].frames = Math.max(0, hotspotTracker[id].frames - 3);
         if (hotspotTracker[id].frames === 0) delete hotspotTracker[id];
       }
     });
 
-    // Confirmed = persisted >= PERSISTENCE_FRAMES
+    // Confirmed = persisted 20+ frames AND strong score
     confirmedHotspots = Object.entries(hotspotTracker)
-      .filter(([id, t]) => t.frames >= PERSISTENCE_FRAMES)
+      .filter(([id, t]) => t.frames >= 20 && t.avgScore >= 0.22)
       .map(([id, t]) => ({ id, ...t }))
       .sort((a, b) => b.frames - a.frames);
 
@@ -577,194 +667,107 @@ function startIRScan() {
     octx.clearRect(0, 0, overlay.width, overlay.height);
     const sx = overlay.width / W, sy = overlay.height / H;
 
-    // Draw raw detections (faint)
+    // Faint heat map — only IR-scored pixels
     raw.forEach(p => {
-      octx.fillStyle = 'rgba(255,34,68,' + (p.score * 0.08) + ')';
+      octx.fillStyle = 'rgba(200,80,255,' + (p.score * 0.12) + ')';
       octx.fillRect(p.x * sx - 1, p.y * sy - 1, 3, 3);
     });
 
-    // Draw confirmed hotspots with full targeting UI
+    // Confirmed hotspot overlays
     confirmedHotspots.forEach((t, i) => {
       const cx = t.lastX * sx, cy = t.lastY * sy;
-      const persistFactor = Math.min(1, t.frames / 30);
-      const radius = 28 + t.maxSize * 1.5;
+      const persistFactor = Math.min(1, t.frames / 40);
+      const radius = 26 + t.maxSize * 1.2;
       const pulse = Math.sin(frameCount * 0.1 + i * 2.1) * 0.5 + 0.5;
 
       // Outer pulsing ring
-      octx.strokeStyle = 'rgba(255,34,68,' + (0.4 + pulse * 0.5) + ')';
+      octx.strokeStyle = 'rgba(255,34,68,' + (0.45 + pulse * 0.5) + ')';
       octx.lineWidth = 1.5;
-      octx.beginPath(); octx.arc(cx, cy, radius * (1 + pulse * 0.12), 0, Math.PI * 2); octx.stroke();
+      octx.beginPath(); octx.arc(cx, cy, radius * (1 + pulse * 0.1), 0, Math.PI*2); octx.stroke();
 
       // Inner ring
-      octx.strokeStyle = 'rgba(255,100,100,' + (0.3 + pulse * 0.4) + ')';
+      octx.strokeStyle = 'rgba(200,80,255,' + (0.4 + pulse * 0.4) + ')';
       octx.lineWidth = 1;
-      octx.beginPath(); octx.arc(cx, cy, radius * 0.55, 0, Math.PI * 2); octx.stroke();
+      octx.beginPath(); octx.arc(cx, cy, radius * 0.5, 0, Math.PI*2); octx.stroke();
 
-      // Crosshair lines
-      octx.strokeStyle = 'rgba(255,34,68,' + (0.5 + persistFactor * 0.4) + ')';
+      // Crosshair
+      octx.strokeStyle = 'rgba(255,34,68,' + (0.5 + persistFactor * 0.45) + ')';
       octx.lineWidth = 1;
-      const cl = radius * 1.6;
-      [[cx - cl, cy, cx - radius * 1.05, cy],
-       [cx + radius * 1.05, cy, cx + cl, cy],
-       [cx, cy - cl, cx, cy - radius * 1.05],
-       [cx, cy + radius * 1.05, cx, cy + cl]].forEach(([x1,y1,x2,y2]) => {
-        octx.beginPath(); octx.moveTo(x1, y1); octx.lineTo(x2, y2); octx.stroke();
+      const cl = radius * 1.55;
+      [[cx-cl,cy,cx-radius*1.05,cy],[cx+radius*1.05,cy,cx+cl,cy],
+       [cx,cy-cl,cx,cy-radius*1.05],[cx,cy+radius*1.05,cx,cy+cl]].forEach(([x1,y1,x2,y2]) => {
+        octx.beginPath(); octx.moveTo(x1,y1); octx.lineTo(x2,y2); octx.stroke();
       });
 
       // Corner brackets
-      const bSize = 10;
-      [[-1,-1],[1,-1],[-1,1],[1,1]].forEach(([sx2, sy2]) => {
-        const bx = cx + sx2 * radius * 1.05;
-        const by = cy + sy2 * radius * 1.05;
+      [[-1,-1],[1,-1],[-1,1],[1,1]].forEach(([bsx,bsy]) => {
+        const bx = cx + bsx * radius * 1.05, by = cy + bsy * radius * 1.05;
         octx.strokeStyle = 'rgba(255,34,68,' + (0.7 + persistFactor * 0.3) + ')';
         octx.lineWidth = 2;
-        octx.beginPath(); octx.moveTo(bx, by); octx.lineTo(bx + sx2 * bSize, by); octx.stroke();
-        octx.beginPath(); octx.moveTo(bx, by); octx.lineTo(bx, by + sy2 * bSize); octx.stroke();
+        octx.beginPath(); octx.moveTo(bx,by); octx.lineTo(bx+bsx*10,by); octx.stroke();
+        octx.beginPath(); octx.moveTo(bx,by); octx.lineTo(bx,by+bsy*10); octx.stroke();
       });
 
-      // Glow fill
-      const grd = octx.createRadialGradient(cx, cy, 0, cx, cy, radius * 0.6);
-      grd.addColorStop(0, 'rgba(255,34,68,' + (0.06 + persistFactor * 0.08) + ')');
-      grd.addColorStop(1, 'rgba(255,34,68,0)');
+      // Glow
+      const grd = octx.createRadialGradient(cx,cy,0,cx,cy,radius*0.6);
+      grd.addColorStop(0,'rgba(200,60,255,' + (0.07 + persistFactor*0.07) + ')');
+      grd.addColorStop(1,'rgba(200,60,255,0)');
       octx.fillStyle = grd;
-      octx.beginPath(); octx.arc(cx, cy, radius * 0.6, 0, Math.PI * 2); octx.fill();
+      octx.beginPath(); octx.arc(cx,cy,radius*0.6,0,Math.PI*2); octx.fill();
 
-      // Label
-      octx.fillStyle = 'rgba(0,0,0,0.75)';
-      octx.fillRect(cx - 32, cy - radius - 18, 64, 14);
-      octx.fillStyle = 'rgba(255,34,68,' + (0.8 + persistFactor * 0.2) + ')';
-      octx.font = 'bold 8px monospace';
-      octx.textAlign = 'center';
-      octx.fillText('IR#' + (i+1) + ' [' + t.frames + 'f]', cx, cy - radius - 7);
-
-      // Position label
-      const posX = Math.round(t.lastX / W * 100);
-      const posY = Math.round(t.lastY / H * 100);
-      octx.fillStyle = 'rgba(255,179,0,0.85)';
+      // Labels
+      octx.fillStyle = 'rgba(0,0,0,0.8)';
+      octx.fillRect(cx-36, cy-radius-20, 72, 15);
+      octx.fillStyle = 'rgba(255,34,68,' + (0.85 + persistFactor * 0.15) + ')';
+      octx.font = 'bold 8px monospace'; octx.textAlign = 'center';
+      const conf = Math.min(99, Math.round(persistFactor * 60 + t.avgScore * 40));
+      octx.fillText('IR CAMERA #' + (i+1) + ' [' + conf + '%]', cx, cy - radius - 8);
+      octx.fillStyle = 'rgba(255,179,0,0.9)';
       octx.font = '7px monospace';
-      octx.fillText(posX + '% ' + posY + '%', cx, cy + radius + 12);
+      octx.fillText(Math.round(t.lastX/W*100) + '% ' + Math.round(t.lastY/H*100) + '%', cx, cy + radius + 13);
     });
 
     // ── UPDATE UI ──
+    const candidates = Object.keys(hotspotTracker).length;
     if (count === 0) {
-      setMod('ir', 'CLEAR', 'safe', 0, 'No persistent IR sources (' + frameCount + ' frames)');
-      document.getElementById('irLog').textContent = 'Tracking ' + Object.keys(hotspotTracker).length + ' candidates...';
+      setMod('ir','CLEAR','safe',0,'No IR cameras — ' + candidates + ' candidates tracked');
+      document.getElementById('irLog').textContent = 'Tracking ' + candidates + ' candidates (need 20 frames + strong IR signature)';
       document.getElementById('pinpointPanel').style.display = 'none';
-      detectionConfidence = Math.max(0, detectionConfidence - 2);
+      detectionConfidence = Math.max(0, detectionConfidence - 1);
     } else {
       const t = confirmedHotspots[0];
-      const pct = Math.min(100, t.frames * 3);
-      setMod('ir', count + ' CAM' + (count > 1 ? 'S' : ''), count > 1 ? 'alert' : 'warn', pct, count + ' persistent IR source' + (count > 1 ? 's' : '') + ' — ' + t.frames + ' frames');
-      document.getElementById('irLog').textContent = 'Primary @ (' + Math.round(t.lastX/W*100) + '%, ' + Math.round(t.lastY/H*100) + '%), ' + t.frames + ' frames persistent';
-      // Pinpoint
+      const conf = Math.min(99, Math.round(Math.min(1,t.frames/40)*60 + t.avgScore*40));
+      const lvl = conf > 65 ? 'alert' : 'warn';
+      setMod('ir', count + (count>1?' CAMERAS':' CAMERA'), lvl, conf, conf + '% confidence — ' + t.frames + ' frame persistence');
+      document.getElementById('irLog').textContent = 'Primary: (' + Math.round(t.lastX/W*100) + '%, ' + Math.round(t.lastY/H*100) + '%) score=' + t.avgScore.toFixed(2) + ' frames=' + t.frames;
       updatePinpoint(confirmedHotspots, W, H);
-      pushThreat(count > 1 ? 2 : 1, 'ir', count + ' persistent IR hotspot' + (count>1?'s':'') + ' detected');
-      detectionConfidence = Math.min(100, detectionConfidence + 3);
+      pushThreat(count > 1 ? 2 : 1, 'ir', count + ' IR camera source' + (count>1?'s':'') + ' — ' + conf + '% confidence');
+      detectionConfidence = Math.min(100, detectionConfidence + 2);
     }
 
-    // Confidence meter
+    // Update pills
+    const pills = document.getElementById('hsPills'); pills.innerHTML = '';
+    confirmedHotspots.slice(0,4).forEach((t, i) => {
+      const conf = Math.min(99, Math.round(Math.min(1,t.frames/40)*60 + t.avgScore*40));
+      const p = document.createElement('div'); p.className = 'hspill';
+      p.textContent = '#'+(i+1)+' '+conf+'% ('+Math.round(t.lastX/W*100)+'%,'+Math.round(t.lastY/H*100)+'%)';
+      pills.appendChild(p);
+    });
+
     document.getElementById('confV').textContent = detectionConfidence + '%';
     document.getElementById('confV').className = 'sv' + (detectionConfidence > 70 ? ' r' : detectionConfidence > 40 ? ' a' : '');
 
-    // Confidence HUD pills
-    const hud = document.getElementById('confHud');
-    hud.innerHTML = '';
-    if (confirmedHotspots.length > 0) {
-      confirmedHotspots.slice(0, 3).forEach((t, i) => {
-        const conf = Math.min(100, t.frames * 3);
-        const p = document.createElement('div');
-        p.className = 'conf-pill' + (conf > 60 ? ' hi' : '');
-        p.textContent = 'IR#' + (i+1) + ' ' + conf + '% CONF';
-        hud.appendChild(p);
-      });
-    }
+    const hud = document.getElementById('confHud'); hud.innerHTML = '';
+    confirmedHotspots.slice(0,3).forEach((t, i) => {
+      const conf = Math.min(99, Math.round(Math.min(1,t.frames/40)*60 + t.avgScore*40));
+      const p = document.createElement('div'); p.className = 'conf-pill' + (conf > 60 ? ' hi' : '');
+      p.textContent = '#'+(i+1)+' '+conf+'% CONF | score '+t.avgScore.toFixed(2);
+      hud.appendChild(p);
+    });
 
     rafId = requestAnimationFrame(frame);
   }
   frame();
-}
-
-// ═══════════════════════════════════════════════════════
-// PINPOINT + BRAND IDENTIFICATION
-// ═══════════════════════════════════════════════════════
-function updatePinpoint(hotspots, W, H) {
-  const panel = document.getElementById('pinpointPanel');
-  panel.style.display = 'block';
-  const t = hotspots[0];
-  const posX = Math.round(t.lastX / W * 100);
-  const posY = Math.round(t.lastY / H * 100);
-
-  // Distance estimation based on LED cluster apparent size
-  // A typical IR LED cluster at 1m appears ~50px wide on a 1080p sensor
-  const apparentSize = t.maxSize * 3; // scaled
-  const estDist = apparentSize > 0 ? Math.round(150 / apparentSize * 10) / 10 : 0;
-  const distText = estDist > 0 ? (estDist < 1 ? Math.round(estDist * 100) + 'cm' : estDist.toFixed(1) + 'm') : '--';
-
-  // Bearing from center
-  const dx = posX - 50, dy = posY - 50;
-  const bearingNames = ['CENTER','RIGHT','LOWER-R','DOWN','LOWER-L','LEFT','UPPER-L','UP','UPPER-R'];
-  const angle = Math.atan2(dy, dx) * 180 / Math.PI;
-  const bearing = angle < -157.5 ? 'LEFT' : angle < -112.5 ? 'UPPER-L' : angle < -67.5 ? 'UP' : angle < -22.5 ? 'UPPER-R' :
-                  angle < 22.5 ? 'RIGHT' : angle < 67.5 ? 'LOWER-R' : angle < 112.5 ? 'DOWN' : angle < 157.5 ? 'LOWER-L' : 'LEFT';
-
-  // LED count estimation
-  const ledCount = Math.max(1, Math.round(t.maxSize * 0.8));
-
-  document.getElementById('ppX').textContent = posX + '%';
-  document.getElementById('ppY').textContent = posY + '%';
-  document.getElementById('ppDist').textContent = distText;
-  document.getElementById('ppAngle').textContent = bearing;
-  document.getElementById('ppLeds').textContent = '~' + ledCount;
-  document.getElementById('ppConf').textContent = Math.min(100, t.frames * 3) + '%';
-  document.getElementById('distV').textContent = distText;
-
-  // Brand fingerprinting from IR LED count and pattern
-  identifyBrand(ledCount, t, hotspots.length);
-}
-
-function identifyBrand(ledCount, tracker, totalSources) {
-  // Reset scores
-  Object.values(BRAND_DB).forEach(b => b.confidence = 0);
-
-  // LED count scoring
-  if (ledCount >= 6 && ledCount <= 36) BRAND_DB.hikvision.confidence += 30;
-  if (ledCount >= 4 && ledCount <= 24) BRAND_DB.dahua.confidence += 25;
-  if (ledCount >= 1 && ledCount <= 4)  BRAND_DB.axis.confidence += 20;
-  if (ledCount >= 2 && ledCount <= 6)  BRAND_DB.reolink.confidence += 25;
-  if (ledCount === 2)                   BRAND_DB.wyze.confidence += 35;
-  if (totalSources > 2) BRAND_DB.hikvision.confidence += 15; // multi-cam systems
-
-  // Frame persistence scoring (consumer vs pro)
-  if (tracker.frames > 60) {
-    BRAND_DB.hikvision.confidence += 10;
-    BRAND_DB.dahua.confidence += 10;
-    BRAND_DB.axis.confidence += 15; // pro cameras very stable
-  }
-
-  // Network data boost (if we found it on network)
-  if (currentCamIP) {
-    Object.values(BRAND_DB).forEach(b => b.confidence += 10);
-  }
-
-  // Pick winner
-  const brands = Object.entries(BRAND_DB).filter(([k]) => k !== 'generic');
-  brands.sort((a, b) => b[1].confidence - a[1].confidence);
-  const [bestKey, best] = brands[0];
-  const totalConf = Math.min(95, best.confidence + (tracker.frames > 30 ? 20 : 0));
-
-  const brandResult = document.getElementById('brandResult');
-  if (totalConf > 20) {
-    brandResult.style.display = 'block';
-    document.getElementById('brandName').textContent = best.name;
-    document.getElementById('brandSub').textContent = best.desc + ' // IR Pattern: ' + best.irPattern + ' // ' + best.ledRange[0] + '-' + best.ledRange[1] + ' LEDs';
-    document.getElementById('brandConf').textContent = 'Identification confidence: ' + totalConf + '% (' + bestKey.toUpperCase() + ')';
-    addAlert('Brand signature: likely ' + best.name + ' (' + totalConf + '% confidence)', 'warn');
-  } else {
-    brandResult.style.display = 'block';
-    document.getElementById('brandName').textContent = 'Unknown / Generic';
-    document.getElementById('brandSub').textContent = 'Insufficient data for brand identification';
-    document.getElementById('brandConf').textContent = '~' + ledCount + ' estimated IR LEDs detected';
-  }
 }
 
 // ═══════════════════════════════════════════════════════
